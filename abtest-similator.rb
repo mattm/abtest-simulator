@@ -1,67 +1,60 @@
+require './norm'
+
 module ABTestSimulator
 
 	# Adjust these variables
-	VISITORS_PER_DAY = 300
 	ORIGINAL_CONVERSION_RATE = 0.1
-	VARIATION_OUTCOMES = [-0.1, -0.1, -0.05, 0, 0, 0, 0.05, 0.1, 0.1]
+	VARIATION_OUTCOMES = [-0.2, 0.2]
 
 	# The # of times to simulate your testing strategy before averging the results
 	# The higher the number the more accurate the results will be, but the longer the script will take to run
-	SIMULATIONS = 100
+	SIMULATIONS = 1000
 
 	# Whether or not to output the status of the script as it runs
 	# You'll probably want to set the # of simulations to 1 when turning this on
 	DEBUG = false
 
 	def self.run
-		results = 1.upto(SIMULATIONS).collect do
+		correct_decisions = incorrect_decisions = passed_decisions = 0
+
+		1.upto(SIMULATIONS).each do |simulation|
 
 			# At the start of each series of A/B tests, we need to reset the control's conversion rate
 			control_conversion_rate = ORIGINAL_CONVERSION_RATE
 
-			# Run enough tests to cover an entire year
-			day = 0
-			test_num = 0
+			# We randomly choose an A/B test outcome to determine what the variation's true conversion rate is
+			true_variation_change = VARIATION_OUTCOMES.sample
 
+			# Account for situations where the conversion rate would exceed 100%
+			if control_conversion_rate * (1 + true_variation_change) > 1
+				true_variation_change = 0
+				variation_conversion_rate = 1
+			else
+				variation_conversion_rate = control_conversion_rate * (1 + true_variation_change)
+			end
+
+			status "Control: #{control_conversion_rate.round(2)}, Variation Actual: #{variation_conversion_rate.round(2)}"
+			control_participants = variation_participants = control_conversions = variation_conversions = 0
+
+			# Simulate visitors participating in the A/B test
 			begin
 
-				# We randomly choose an A/B test outcome to determine what the variation's true conversion rate is
-				true_variation_change = VARIATION_OUTCOMES.sample
-
-				# Account for situations where the conversion rate would exceed 100%
-				if control_conversion_rate * (1 + true_variation_change) > 1
-					true_variation_change = 0
-					variation_conversion_rate = 1
+				# Each visitor is assigned either the control or the variation
+				# We keep track of the participants and conversions along the way
+				if rand < 0.5
+					control_participants += 1
+					control_conversions += 1 if rand <= control_conversion_rate
 				else
-					variation_conversion_rate = control_conversion_rate * (1 + true_variation_change)
+					variation_participants += 1
+					variation_conversions += 1 if rand <= variation_conversion_rate
 				end
 
-				status "Resetting, #{control_conversion_rate}, #{variation_conversion_rate}"
-				control_participants = variation_participants = control_conversions = variation_conversions = 0
-				test_num += 1
+				result = evaluate(control_participants, control_conversions, variation_participants, variation_conversions)
+			end until result == "yes" || result == "pass"
 
-				status "\nA/B Test ##{test_num}"
-
-				# Then simulate visitors coming to the site each day
-				begin
-					day += 1
-					1.upto(VISITORS_PER_DAY).each do |visitor|
-
-						# Each visitor is assigned either the control or the variation
-						# We keep track of the participants and conversions along the way
-						if rand < 0.5
-							control_participants += 1
-							control_conversions += 1 if rand <= control_conversion_rate
-						else
-							variation_participants += 1
-							variation_conversions += 1 if rand <= variation_conversion_rate
-						end
-					end
-
-					# status "Day: ##{day}: #{control_conversions}, #{variation_conversions}"
-					should_stop_test = [control_conversions, variation_conversions].max >= 50
-					# should_stop_test = control_participants + variation_participants > 500
-				end until should_stop_test
+			if result == "pass"
+				passed_decisions += 1
+			else
 
 				# At the end of the time period, we check out the results
 				observed_control_conversion_rate = control_conversions.to_f / control_participants.to_f
@@ -75,51 +68,101 @@ module ABTestSimulator
 					winner = "variation"
 				end
 
+				status "\nResults ##{simulation}:"
 				status "Control: #{control_conversions}/#{control_participants} = #{observed_control_conversion_rate.round(3)} (actual conversion rate: #{control_conversion_rate.round(3)})"
 				status "Variation: #{variation_conversions}/#{variation_participants} = #{observed_variation_conversion_rate.round(3)} (actual conversion rate: #{variation_conversion_rate.round(3)}, actual change: #{true_variation_change})"
 				status "Observed winner: #{winner}"
+				status "P Value: " + p_value(control_participants, control_conversions, variation_participants, variation_conversions).round(2).to_s
 
 				# How'd we do?
-				if winner == "variation"
-					status true_variation_change >= 0 ? 'Good choice' : 'Bad choice'
-
-					# If we chose the variation, make it the new control
-					control_conversion_rate = variation_conversion_rate
-					status "New conversion rate: #{control_conversion_rate}"
-				elsif winner == "control"
-					status true_variation_change > 0 ? 'Bad choice' : 'Good choice'
+				if winner == "tie" || true_variation_change == 0 || (winner == "variation" && true_variation_change > 0) || (winner == "control" && true_variation_change < 0)
+					status "Correct Decision"
+					correct_decisions += 1
+				else
+					status "Incorrect Decision"
+					incorrect_decisions += 1
 				end
-			end until day >= 365
-
-			# After a year, record the final conversion rate change
-			simulation_yearly_growth_rate = yearly_growth_rate(control_conversion_rate, day)
-			simulation_tests_per_year = (test_num.to_f / day.to_f) * 365
-			# puts [ORIGINAL_CONVERSION_RATE, control_conversion_rate, overall_growth_rate, daily_growth_rate, yearly_growth_rate, day, test_num, tests_per_year].join("\t")
-
-			[simulation_yearly_growth_rate, simulation_tests_per_year]
+			end
 		end
 
-		yearly_growth_rates = results.collect{ |result| result.first }
-		avg_yearly_growth_rate = (yearly_growth_rates.inject(0){|sum, x| sum + x }.to_f / yearly_growth_rates.length.to_f) * 100
-
-		tests_per_year = results.collect{ |result| result.last }
-		avg_tests_per_year = (tests_per_year.inject(0){|sum, x| sum + x }.to_f / tests_per_year.length.to_f)
-
-		puts avg_yearly_growth_rate.round.to_s + "% per year over #{avg_tests_per_year.round} tests"
+		puts "\nSummary:"
+		puts "Passes: #{passed_decisions}"
+		puts "Correct: #{correct_decisions}"
+		puts "Incorrect: #{incorrect_decisions}"
+		puts "Correct Decisions: #{correct_decisions}/#{correct_decisions + incorrect_decisions}: #{percentage(correct_decisions, correct_decisions + incorrect_decisions)}"
 	end
 
+	#
+	# Outputs a status message to the console
 	def self.status(msg)
 		puts msg if DEBUG
 	end
 
-	# Lets say for a particular simulation we started with a conversion rate of 0.1 and the final test runs
-	# 380 days have passed and the conversion rate is now 0.14. That works out to an overal growth rate of
-	# 0.14/0.1 = 1.4 or +40%. That's for 380 days though, we want 365 days, so we work backwards to figure out
-	# the daily growth rate of 0.0885845%, then use that to figure out the 365-day growth rate of +38.15%
-	def self.yearly_growth_rate(final_control_conversion_rate, number_of_days)
-		overall_growth_rate = final_control_conversion_rate / ORIGINAL_CONVERSION_RATE - 1
-		daily_growth_rate = (1 + overall_growth_rate) ** (1.0 / number_of_days.to_f) - 1
-		(1.0 + daily_growth_rate) ** 365 - 1.0
+	#
+	# Returns a percentage given a numerator and denominator
+	def self.percentage(n, d)
+		if d == 0
+			'N/A'
+		else
+			((n.to_f / d.to_f) * 100.0).round(2).to_s + '%'
+		end
+	end
+
+	# Given the performance of two variations, this returns
+	# 1) "yes" - There is a winner
+	# 2) "no" - There is not a winner (yet)
+	# 3) "pass" - The criteria to declare a winner was never met
+	def self.evaluate(participants_a, conversions_a, participants_b, conversions_b)
+		total_participants = participants_a + participants_b
+
+		# When the significance exceeds some amount:
+
+		return "pass" if total_participants >= 10000
+
+		if gaussian?(participants_a, conversions_a) && gaussian?(participants_b, conversions_b)
+			if p_value(participants_a, conversions_a, participants_b, conversions_b) >= 0.99
+				return "yes"
+			end
+		end
+
+		# When one of the conversions exceeds some amount:
+		# return "yes" if [conversions_a, conversions_b].max >= 100
+
+		# When the total number of conversions exceeds some amount:
+		# return "yes" conversions_a + conversions_b >= 100
+
+		# Leave this in place for situations where the none of the criteria above are met
+		return "no"
+	end
+
+	#
+	# Determines the probability that one variation's conversion rate is greather than another's
+	# For example p_value(500, 200, 500, 220) = 0.9
+	# See: http://www.abtestcalculator.com/
+	def self.p_value(participants_a, converisons_a, participants_b, converisons_b)
+		p1 = converisons_a.to_f / participants_a.to_f
+		se1 = Math.sqrt((p1 * (1 - p1)) / participants_a)
+
+		p2 = converisons_b.to_f / participants_b.to_f
+		se2 = Math.sqrt((p2 * (1 - p2)) / participants_b)
+
+		zscore = (p2 - p1) / Math.sqrt(se1 ** 2 + se2 ** 2)
+
+		significance = Norm.normdist(zscore, 0, 1, true)
+
+		[significance, 1 - significance].max
+	end
+
+	#
+	# Returns whether we can use a Gaussian distribution to approximate the conversion rate distribution
+	def self.gaussian?(participants, conversions)
+		return false unless conversions > 0
+
+		conversion_rate = conversions.to_f / participants.to_f
+		np = participants * conversion_rate
+		nq = participants * (1 - conversion_rate)
+
+		participants >= 30 && np >= 5 && nq >= 5
 	end
 end
 
